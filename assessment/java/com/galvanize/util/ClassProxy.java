@@ -2,6 +2,7 @@ package com.galvanize.util;
 
 import com.google.common.collect.ImmutableMap;
 import com.google.common.reflect.AbstractInvocationHandler;
+import com.google.common.reflect.Invokable;
 import com.google.common.reflect.TypeToken;
 import net.sf.cglib.proxy.Enhancer;
 import net.sf.cglib.proxy.MethodInterceptor;
@@ -19,8 +20,8 @@ public class ClassProxy implements Type {
     private Class<?> delegate = null;
     private ReferenceType referenceType = ReferenceType.CLASS;
 
-    private final HashMap<String, List<Method>> methods = new HashMap<>();
-    private final HashMap<String, Constructor> constructors = new HashMap<>();
+    private final HashMap<String, List<Invokable>> methods = new HashMap<>();
+    private final List<Invokable> constructors = new ArrayList<>();
 
     public static ClassProxy of(Class delegate) {
         return new ClassProxy(delegate);
@@ -30,7 +31,7 @@ public class ClassProxy implements Type {
         try {
             delegate = Class.forName(name);
         } catch (ClassNotFoundException e) {
-            failFormat("Expected to find a class named `%s` but did not", name);
+            failFormat("Expected to find a type named `%s` but did not", name);
         }
     }
 
@@ -42,7 +43,7 @@ public class ClassProxy implements Type {
         return delegate;
     }
 
-    public HashMap<String, List<Method>> getMethods() {
+    public HashMap<String, List<Invokable>> getMethods() {
         return methods;
     }
 
@@ -77,13 +78,14 @@ public class ClassProxy implements Type {
         MethodBuilder builder = fn.apply(new MethodBuilder(getDelegate()));
         builder.withReferenceType(referenceType);
         Method method = builder.build();
-        if (methods.containsKey(builder.getName())) {
-            methods.get(builder.getName()).add(method);
-        } else {
-            ArrayList<Method> items = new ArrayList<>();
-            items.add(method);
+        Invokable invokable = Invokable.from(method);
+
+        List<Invokable> items = methods.get(builder.getName());
+        if (items == null) {
+            items = new ArrayList<>();
             methods.put(builder.getName(), items);
         }
+        items.add(invokable);
         return this;
     }
 
@@ -94,6 +96,10 @@ public class ClassProxy implements Type {
                 .returns(Void.TYPE)
                 .named("main")
                 .withParameters(String[].class));
+    }
+
+    public ClassProxy ensureGetter(Class property) {
+        return ensureGetter(property.getSimpleName(), property);
     }
 
     public ClassProxy ensureGetter(String name, Type type) {
@@ -125,15 +131,18 @@ public class ClassProxy implements Type {
             } else if (object instanceof TypeToken<?>) {
                 return ((TypeToken<?>) object).getRawType();
             } else {
-                throw new IllegalArgumentException(
-                        "You must pass a Class, TypeToken or ClassProxy to ensureConstructor, but you passed " + object.toString()
-                );
+                throw new IllegalArgumentException(String.format(
+                    "You must pass a `Class`, `TypeToken` or `ClassProxy` to `ensureConstructor`, but you passed `(%s) %s`",
+                        object.getClass().getSimpleName(),
+                        object.toString()
+                ));
             }
         }).toArray(Class[]::new);
 
         try {
             Constructor constructor = getDelegate().getConstructor(classArgs);
-            constructors.put(parameterTypeNames(constructor.getParameterTypes()), constructor);
+            Invokable invokable = Invokable.from(constructor);
+            constructors.add(invokable);
         } catch (NoSuchMethodException e) {
             failFormat(
                     "Expected `%s` to define a constructor with the signature `%s(%s)`",
@@ -155,12 +164,15 @@ public class ClassProxy implements Type {
                 failFormat("Could not instantiate `%s` with no args", getDelegate().getSimpleName());
             }
         } else {
-            Object[] mappedArgs = Arrays.stream(args).map(arg -> arg instanceof InstanceProxy ? ((InstanceProxy) arg).getDelegate() : arg).toArray();
-            Optional<Constructor> matchedConstructor = bestMatchConstructor(new ArrayList<Constructor>(constructors.values()), args);
+            Object[] mappedArgs = Arrays.stream(args)
+                    .map(arg -> arg instanceof InstanceProxy ? ((InstanceProxy) arg).getDelegate() : arg)
+                    .toArray();
+
+            Optional<Invokable> matchedConstructor = bestMatch(constructors, mappedArgs);
             if (matchedConstructor.isPresent()) {
                 try {
-                    return new InstanceProxy(matchedConstructor.get().newInstance(mappedArgs), methods);
-                } catch (InstantiationException | IllegalAccessException | InvocationTargetException e) {
+                    return new InstanceProxy(matchedConstructor.get().invoke(delegate, mappedArgs), methods);
+                } catch (IllegalAccessException | InvocationTargetException e) {
                     failFormat("Could not instantiate `%s` with no args", getDelegate().getSimpleName());
                 }
             }
@@ -189,6 +201,33 @@ public class ClassProxy implements Type {
 
     public Object invokeExpectingException(String methodName, Object... args) throws Throwable {
         return ReflectionUtils.invoke(methods, delegate, methodName, args);
+    }
+
+    public Throwable assertInvokeThrows(ClassProxy exceptionProxy, String methodName, Object... args) {
+        return assertInvokeThrows(exceptionProxy.delegate, methodName, args);
+    }
+
+    public Throwable assertInvokeThrows(Class expectedType, String methodName, Object... args) {
+        try {
+            invokeExpectingException(methodName, args);
+        } catch (Throwable actualException) {
+            if (expectedType.isInstance(actualException)) {
+                return actualException;
+            } else {
+                failFormat(
+                        "Expected `%s` to throw a `%s` but it threw `%s`",
+                        delegate.getClass(),
+                        expectedType.getSimpleName(),
+                        actualException.getClass().getSimpleName()
+                );
+            }
+        }
+        failFormat(
+                "Expected `%s` to throw a %s but it threw nothing",
+                delegate.getClass(),
+                expectedType.getSimpleName()
+        );
+        return null;
     }
 
     public ClassProxy ensureImplements(ClassProxy parent) {
@@ -284,23 +323,28 @@ public class ClassProxy implements Type {
     public ClassProxy ensureCheckedException() {
         if (RuntimeException.class.isAssignableFrom(delegate)) {
             failFormat(
-                    "Expected %s to be a checked exception, but it inherits from RuntimeException",
+                    "Expected `%s` to be a checked exception, but it inherits from `RuntimeException`",
                     delegate.getSimpleName()
             );
         }
         if (Error.class.isAssignableFrom(delegate)) {
             failFormat(
-                    "Expected %s to be a checked exception, but it inherits from Error",
+                    "Expected `%s` to be a checked exception, but it inherits from `Error`",
                     delegate.getSimpleName()
             );
         }
         if (!Exception.class.isAssignableFrom(delegate)) {
             failFormat(
-                    "Expected %s to inherit from Exception but it did not",
+                    "Expected `%s` to inherit from `Exception` but it did not",
                     delegate.getSimpleName()
             );
         }
 
         return this;
     }
+
+    public Constructor<?>[] getConstructors() {
+        return delegate.getConstructors();
+    }
+
 }
