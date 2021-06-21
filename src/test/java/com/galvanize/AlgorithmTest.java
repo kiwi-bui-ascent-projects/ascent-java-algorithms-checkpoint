@@ -1,6 +1,5 @@
 package com.galvanize;
 
-
 import org.junit.jupiter.api.Test;
 
 import java.util.Arrays;
@@ -18,7 +17,9 @@ public class AlgorithmTest {
 
     @Test
     void allEqualsFailsTest() {
-        assertFalse(algorithm.allEqual("aAbAaaAa"), "Should return true for all characters equal");
+        assertFalse(algorithm.allEqual("BaAAaaAa"), "Should return false for all characters equal");
+        assertFalse(algorithm.allEqual("aAbAaaAa"), "Should return false for all characters equal");
+        assertFalse(algorithm.allEqual("aAAaaAab"), "Should return false for all characters equal");
     }
 
     @Test
